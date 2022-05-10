@@ -15,14 +15,12 @@ package badger
 //  that John linked - maybe just use/wrap that
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	badger "github.com/dgraph-io/badger/v3"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	goprocess "github.com/jbenet/goprocess"
-	"github.com/sourcenetwork/defradb/datastore/iterable"
 )
 
 type BadgerIterator struct {
@@ -35,38 +33,6 @@ type BadgerIterator struct {
 	closedEarly    bool
 	iteratorLock   sync.RWMutex
 	reversedOrder  bool
-}
-
-func (t *txn) GetIterator(q dsq.Query) (iterable.Iterator, error) {
-	opt := badger.DefaultIteratorOptions
-	// Prefetching prevents the re-use of the iterator
-	opt.PrefetchValues = false
-
-	var reversedOrder bool
-	// Handle ordering
-	if len(q.Orders) > 0 {
-		switch orderType := q.Orders[0].(type) {
-		case dsq.OrderByKey, *dsq.OrderByKey:
-			// We order by key by default.
-			reversedOrder = false
-		case dsq.OrderByKeyDescending, *dsq.OrderByKeyDescending:
-			// Reverse order by key
-			opt.Reverse = true
-			reversedOrder = true
-		default:
-			return nil, fmt.Errorf("Order format not supported: %v", orderType)
-		}
-	}
-
-	badgerIterator := t.txn.NewIterator(opt)
-
-	iterator := BadgerIterator{
-		iterator:      badgerIterator,
-		txn:           *t,
-		reversedOrder: reversedOrder,
-	}
-
-	return &iterator, nil
 }
 
 func (iterator *BadgerIterator) Close() error {
