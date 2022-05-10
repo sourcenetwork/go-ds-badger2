@@ -15,6 +15,7 @@ package badger
 //  that John linked - maybe just use/wrap that
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	badger "github.com/dgraph-io/badger/v3"
@@ -226,4 +227,49 @@ func (iterator *BadgerIterator) yieldResults(
 			return
 		}
 	}
+}
+
+func (d *Datastore) NewIterableTransaction(
+	ctx context.Context,
+	readOnly bool,
+) (*txn, error) {
+	d.closeLk.RLock()
+	defer d.closeLk.RUnlock()
+	if d.closed {
+		return nil, ErrClosed
+	}
+
+	return &txn{d, d.DB.NewTransaction(!readOnly), false}, nil
+}
+
+func (t *txn) GetIterator(q dsq.Query) (*BadgerIterator, error) {
+	opt := badger.DefaultIteratorOptions
+	// Prefetching prevents the re-use of the iterator
+	opt.PrefetchValues = false
+
+	var reversedOrder bool
+	// Handle ordering
+	if len(q.Orders) > 0 {
+		switch orderType := q.Orders[0].(type) {
+		case dsq.OrderByKey, *dsq.OrderByKey:
+			// We order by key by default.
+			reversedOrder = false
+		case dsq.OrderByKeyDescending, *dsq.OrderByKeyDescending:
+			// Reverse order by key
+			opt.Reverse = true
+			reversedOrder = true
+		default:
+			return nil, fmt.Errorf("Order format not supported: %v", orderType)
+		}
+	}
+
+	badgerIterator := t.txn.NewIterator(opt)
+
+	iterator := BadgerIterator{
+		iterator:      badgerIterator,
+		txn:           *t,
+		reversedOrder: reversedOrder,
+	}
+
+	return &iterator, nil
 }
