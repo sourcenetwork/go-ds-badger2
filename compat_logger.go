@@ -1,3 +1,5 @@
+// Code copy-pasted from https://github.com/ipfs/go-ds-badger2/blob/master/compat_logger.go
+
 package badger
 
 import "go.uber.org/zap"

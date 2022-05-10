@@ -1,3 +1,7 @@
+// Code copy-pasted from https://github.com/ipfs/go-ds-badger2/blob/master/datastore.go
+// then badger version updated to version 3, and some non-compiling badger defaults
+// removed from `init()`
+
 package badger
 
 import (
@@ -9,12 +13,12 @@ import (
 	"sync"
 	"time"
 
-	badger "github.com/dgraph-io/badger/v2"
-	options "github.com/dgraph-io/badger/v2/options"
+	badger "github.com/dgraph-io/badger/v3"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	logger "github.com/ipfs/go-log/v2"
 	goprocess "github.com/jbenet/goprocess"
+	"github.com/sourcenetwork/defradb/datastore/iterable"
 	"go.uber.org/zap"
 )
 
@@ -35,7 +39,6 @@ type Datastore struct {
 	gcInterval     time.Duration
 
 	syncWrites bool
-	ttl        time.Duration
 }
 
 // Implements the datastore.Batch interface, enabling batching support for
@@ -72,63 +75,11 @@ type Options struct {
 	// GcInterval.
 	GcSleep time.Duration
 
-	// TTL sets the expiration time for all newly added keys. After expiration,
-	// the keys will no longer be retrievable and will be removed by garbage
-	// collection.
-	//
-	// The default value is 0, which means no TTL.
-	TTL time.Duration
-
 	badger.Options
 }
 
 // DefaultOptions are the default options for the badger datastore.
 var DefaultOptions Options
-
-// WithGcDiscardRatio returns a new Options value with GcDiscardRatio set to the given value.
-//
-// Please refer to the Badger docs to see what this is for
-//
-// Default value is 0.2
-func (opt Options) WithGcDiscardRatio(ratio float64) Options {
-	opt.GcDiscardRatio = ratio
-	return opt
-}
-
-// WithGcInterval returns a new Options value with GcInterval set to the given
-// value.
-//
-// GcInterval specifies the interval between garbage collection cycles. If zero,
-// the datastore will perform no automatic garbage collection.
-//
-// Default value is 15 minutes.
-func (opt Options) WithGcInterval(interval time.Duration) Options {
-	opt.GcInterval = interval
-	return opt
-}
-
-// WithGcSleep returns a new Options value with GcSleep set to the given value.
-//
-// GcSleep specifies the sleep time between rounds of a single garbage collection
-// cycle. If zero, the datastore will only perform one round of GC per GcInterval.
-//
-// Default value is 10 seconds.
-func (opt Options) WithGcSleep(sleep time.Duration) Options {
-	opt.GcSleep = sleep
-	return opt
-}
-
-// WithTTL returns a new Options value with TTL set to the given value.
-//
-// TTL sets the expiration time for all newly added keys. After expiration,
-// the keys will no longer be retrievable and will be removed by garbage
-// collection.
-//
-// Default value is 0, which means no TTL.
-func (opt Options) WithTTL(ttl time.Duration) Options {
-	opt.TTL = ttl
-	return opt
-}
 
 func init() {
 	DefaultOptions = Options{
@@ -141,30 +92,28 @@ func init() {
 	// read-only and efficiently queried. We don't do that and hanging on
 	// stop isn't nice.
 	DefaultOptions.Options.CompactL0OnClose = false
+	/*
+		// The alternative is "crash on start and tell the user to fix it". This
+		// will truncate corrupt and unsynced data, which we don't guarantee to
+		// persist anyways.
+		DefaultOptions.Options.Truncate = true
 
-	// The alternative is "crash on start and tell the user to fix it". This
-	// will truncate corrupt and unsynced data, which we don't guarantee to
-	// persist anyways.
-	DefaultOptions.Options.Truncate = true
+		// Uses less memory, is no slower when writing, and is faster when
+		// reading (in some tests).
+		DefaultOptions.Options.ValueLogLoadingMode = options.FileIO
 
-	// Uses less memory, is no slower when writing, and is faster when
-	// reading (in some tests).
-	DefaultOptions.Options.ValueLogLoadingMode = options.FileIO
+		// Explicitly set this to mmap. This doesn't use much memory anyways.
+		DefaultOptions.Options.TableLoadingMode = options.MemoryMap
 
-	// Explicitly set this to mmap. This doesn't use much memory anyways.
-	DefaultOptions.Options.TableLoadingMode = options.MemoryMap
-
-	// Reduce this from 64MiB to 16MiB. That means badger will hold on to
-	// 20MiB by default instead of 80MiB.
-	//
-	// This does not appear to have a significant performance hit.
-	DefaultOptions.Options.MaxTableSize = 16 << 20
+		// Reduce this from 64MiB to 16MiB. That means badger will hold on to
+		// 20MiB by default instead of 80MiB.
+		//
+		// This does not appear to have a significant performance hit.
+		DefaultOptions.Options.MaxTableSize = 16 << 20*/
 }
 
 var _ ds.Datastore = (*Datastore)(nil)
-var _ ds.PersistentDatastore = (*Datastore)(nil)
 var _ ds.TxnDatastore = (*Datastore)(nil)
-var _ ds.Txn = (*txn)(nil)
 var _ ds.TTLDatastore = (*Datastore)(nil)
 var _ ds.GCDatastore = (*Datastore)(nil)
 var _ ds.Batching = (*Datastore)(nil)
@@ -178,19 +127,16 @@ func NewDatastore(path string, options *Options) (*Datastore, error) {
 	var gcDiscardRatio float64
 	var gcSleep time.Duration
 	var gcInterval time.Duration
-	var ttl time.Duration
 	if options == nil {
 		opt = DefaultOptions.Options
 		gcDiscardRatio = DefaultOptions.GcDiscardRatio
 		gcSleep = DefaultOptions.GcSleep
 		gcInterval = DefaultOptions.GcInterval
-		ttl = DefaultOptions.TTL
 	} else {
 		opt = options.Options
 		gcDiscardRatio = options.GcDiscardRatio
 		gcSleep = options.GcSleep
 		gcInterval = options.GcInterval
-		ttl = options.TTL
 	}
 
 	if gcSleep <= 0 {
@@ -209,7 +155,10 @@ func NewDatastore(path string, options *Options) (*Datastore, error) {
 	kv, err := badger.Open(opt)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "manifest has unsupported version:") {
-			err = fmt.Errorf("unsupported badger version, use github.com/ipfs/badgerds-upgrade to upgrade: %s", err.Error())
+			err = fmt.Errorf(
+				"unsupported badger version, use github.com/ipfs/badgerds-upgrade to upgrade: %s",
+				err.Error(),
+			)
 		}
 		return nil, err
 	}
@@ -221,7 +170,6 @@ func NewDatastore(path string, options *Options) (*Datastore, error) {
 		gcSleep:        gcSleep,
 		gcInterval:     gcInterval,
 		syncWrites:     opt.SyncWrites,
-		ttl:            ttl,
 	}
 
 	// Start the GC process if requested.
@@ -280,6 +228,19 @@ func (d *Datastore) newImplicitTransaction(readOnly bool) *txn {
 	return &txn{d, d.DB.NewTransaction(!readOnly), true}
 }
 
+func (d *Datastore) NewIterableTransaction(
+	ctx context.Context,
+	readOnly bool,
+) (iterable.IterableTxn, error) {
+	d.closeLk.RLock()
+	defer d.closeLk.RUnlock()
+	if d.closed {
+		return nil, ErrClosed
+	}
+
+	return &txn{d, d.DB.NewTransaction(!readOnly), false}, nil
+}
+
 func (d *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 	d.closeLk.RLock()
 	defer d.closeLk.RUnlock()
@@ -290,14 +251,8 @@ func (d *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 	txn := d.newImplicitTransaction(false)
 	defer txn.discard()
 
-	if d.ttl > 0 {
-		if err := txn.putWithTTL(key, value, d.ttl); err != nil {
-			return err
-		}
-	} else {
-		if err := txn.put(key, value); err != nil {
-			return err
-		}
+	if err := txn.put(key, value); err != nil {
+		return err
 	}
 
 	return txn.commit()
@@ -317,7 +272,12 @@ func (d *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	return d.DB.Sync()
 }
 
-func (d *Datastore) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
+func (d *Datastore) PutWithTTL(
+	ctx context.Context,
+	key ds.Key,
+	value []byte,
+	ttl time.Duration,
+) error {
 	d.closeLk.RLock()
 	defer d.closeLk.RUnlock()
 	if d.closed {
@@ -508,20 +468,11 @@ func (b *batch) Put(ctx context.Context, key ds.Key, value []byte) error {
 	if b.ds.closed {
 		return ErrClosed
 	}
-
-	if b.ds.ttl > 0 {
-		return b.putWithTTL(key, value, b.ds.ttl)
-	}
-
 	return b.put(key, value)
 }
 
 func (b *batch) put(key ds.Key, value []byte) error {
 	return b.writeBatch.Set(key.Bytes(), value)
-}
-
-func (b *batch) putWithTTL(key ds.Key, value []byte, ttl time.Duration) error {
-	return b.writeBatch.SetEntry(badger.NewEntry(key.Bytes(), value).WithTTL(ttl))
 }
 
 func (b *batch) Delete(ctx context.Context, key ds.Key) error {
@@ -584,11 +535,6 @@ func (t *txn) Put(ctx context.Context, key ds.Key, value []byte) error {
 	if t.ds.closed {
 		return ErrClosed
 	}
-
-	if t.ds.ttl > 0 {
-		return t.putWithTTL(key, value, t.ds.ttl)
-	}
-
 	return t.put(key, value)
 }
 
@@ -925,7 +871,8 @@ func (t *txn) query(q dsq.Query) (dsq.Results, error) {
 		}
 	})
 
-	go qrb.Process.CloseAfterChildren() //nolint
+	// nolint:errcheck
+	go qrb.Process.CloseAfterChildren()
 
 	return qrb.Results(), nil
 }
